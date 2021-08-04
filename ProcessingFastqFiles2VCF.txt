@@ -1,0 +1,253 @@
+### This is a general workflow to move from fastq files to a dataset useful for QTL mapping
+### Major steps:
+	1. Filter, map and convert fastq files to bam files
+	2. Filter and convert bam files to vcf files
+	3. Filter parental vcf files
+	4. Filter RIL vcf files
+	5. Lepmap
+	
+### General steps for fastq to vcf files:
+	1. Index reference genome for alignment
+	2. Remove adapters and low quality sequences
+	3. Map reads to the genome
+	4. Quality filter and sort (converts sam to bam files) and add read groups
+	5. Convert bam files to gvcf files
+	
+### General steps for filtering parents:
+	1. Calculate read depth of each parental vcf
+		1a. Filter parents on depth individually
+	2. Combine, joint genotype, and quality filter parental vcf files
+	3. Calculate and filter allele frequency (only want 0.5; e.g. each SNP should be fixed in either parent)
+		3a. This is the final list of SNPs to keep in dataset prior to filtering RILs
+
+### General steps for filtering RILs:
+	1. Combine and joint genotype vcf file
+	2. Filter vcf of all inds on the text file from previous step
+	3. Filter vcf on quality
+	4. Filter vcf on missingness 
+	
+######## Details for each major step
+# Small notes: any line with an '#' is instruction or notes for the user; any line of code with a '>' is NOT run by the user, but is contained within a bash script
+# any line of code without an '>' is run by the user
+#### Step 1: Detailed steps for fastq to bam files
+### Use script: run_fastq2bams.sh
+
+sbatch run_fastq2bams.sh
+
+#### The run_fastq2bams.sh script does the following (all the below commands are contained within the 'run_fastq2bams.sh' script):
+## 1: Index reference genome
+ >bwa index CE10g_v2.0.fa
+ >samtools faidx CE10g_v2.0.fa
+
+## 2: unzip fastq files
+>gunzip *.gz
+
+## 3: remove adapters and low quality sequences
+>for i in *1.fq; do name=$(echo $i | rev | cut -c6- | rev)
+>       a=$name".1.fq"
+>       b=$name".2.fq"
+
+>java -jar $EBROOTTRIMMOMATIC>trimmomatic-0.39.jar PE \
+>                -threads 4 "${a}" "${b}" \
+>                "${a}.1.paired.fastq" \
+>                "${a}.1.unpaired.fastq" \
+>                "${b}.2.paired.fastq" \
+>                "${b}.2.unpaired.fastq" \
+>             ILLUMINACLIP:paired_end.fa:2:20:10:4 \
+>             LEADING:3 TRAILING:3 SLIDINGWINDOW:4:15 MINLEN:36
+>done
+
+## 4: map reads to genome
+>for i in `ls *.1.fq.1.paired.fastq`; do newname=$(echo $i | rev | cut -c21- | rev)
+>        a=$newname".1.fq.1.paired.fastq"
+>        b=$newname".2.fq.2.paired.fastq"
+>        bwa mem /scratch/vas59108/references/cardRef/CE10g_v2.0.fa -t 8 "${a}" "${b}" > "${newname}.sam"
+>done
+
+## 5: quality filter and sort sam, convert to bam
+>for f in *.sam
+>do
+>  	samtools view -q 29 -b $f > ${f>.sam>}.bam
+>done
+
+>for f in *.bam
+>do
+>  	samtools sort $f -o ${f%.*}_sorted.bam
+>done
+
+## 6: add read groups
+>for f in *_sorted.bam
+>do
+>time java -jar $EBROOTPICARD>picard.jar AddOrReplaceReadGroups \
+>                I=$f \
+>                O=${f>_sorted.bam>}_RGsorted.bam \
+>                RGSM=$f \
+>                RGLB=NEBNext \
+>                RGPL=Illumina \
+>                RGPU=UNKNOWN VALIDATION_STRINGENCY=LENIENT; # adds read groups
+>done
+
+## 7: index bam files
+>for f in *RGsorted.bam
+>do
+>  	samtools index $f;
+>done
+
+## this will result in a directory of all your for the individual and parental sorted and indexed bam files
+## can look at them in IGV or do other various stats on them
+
+#### Step 2: Detailed steps for bam to gvcf files
+#### The run_bam2gvcf.sh script does the following (all the below commands are contained within the 'run_bam2gvcf.sh' script):
+### Use script: run_bam2gvcf.sh
+
+sbatch run_bam2gvcf.sh
+
+## 1: make a .dict file (required by gatk)
+>gatk CreateSequenceDictionary -R CE10g_v2.0.fa
+
+## 2: call genotypes and convert bams to gvcf files
+>for i in *.bam;
+>do
+>gatk --java-options "-Xmx4g" HaplotypeCaller  \
+>  -R /scratch/vas59108/references/cardRef/CE10g_v2.0.fa \
+>  -I $i \
+>  -O $i.g.vcf.gz \
+>  -ERC GVCF
+>done
+
+## this will result in a directory of all your gvcf files for all your individuals and parents
+## move your two parents into a separate directory, time to work with them only for a few steps
+
+#### Step 3: Calculate read depth and filter parental vcf files 
+## 1: Pull out read depth values from vcf files using vcftools
+vcftools --gzvcf YY3.01A.bam.g.vcf.gz --site-mean-depth --out site_depth_card
+vcftools --gzvcf YY2.12H.bam.g.vcf.gz --site-mean-depth --out site_depth_par
+
+## 2: Read the outfiles from the above code into R to calculate (you will need to do this twice, once for each parent):
+R
+site_depth<-read.table("site_depth_card.ldepth.mean",header=T)
+depth<-na.omit(site_depth$MEAN_DEPTH)
+summary(depth)
+mean(depth)+2*sd(depth) ### This is the 'max' number you want to use for filtering
+
+## 3: Open and edit the script 'run_gatk_parentFilter.sh' and edit the depth values (again, for each parent):
+>  --filter-expression "DP < 4" \ ## minimum read depth threshold
+>  --filter-expression "DP > 16" \ ## maximum read depth threshold
+
+## 4: use script 'run_gatk_parentFilter.sh' to filter parental vcf files (note: you may need to edit the names of the files)
+sbatch run_gatk_parentFilter.sh
+
+# this script will output a final genotyped combined vcf file of both of your parents: gtype_parents_SNPs.vcf.gz
+
+## 5: Calculate allele frequency 
+vcftools --gzvcf final_gtype_parents.g.vcf.gz --freq2 --out afreq --max-alleles 2
+
+## 6: Make a list of those alleles with an allele frequency of 0.5, meaning parents are fixed for alternatives
+awk '{if($NF==0.5) {print $1, $2}}' afreq.frq > afreq_filter.frq
+
+# the text file 'afreq_filter.frq' will be your final list of SNPs from your parents, which will be used as your beginning list for your RILs
+
+#### Step 4: working with your (RIL) individuals now (done with parents)
+## 1: Combine and genotype individual gvcf files of your RILs
+
+sbatch run_cbindGtypeInds.sh
+
+## The run_cbindGtypeInds.sh script does the following (all the below commands are contained within the 'run_cbindGtypeInds.sh' script):
+# 1a: Combine files (NOTE: you will need to list all your individuals separately)
+>gatk --java-options "-Xmx4g"  CombineGVCFs \
+>   -R >scratch/vas59108/references/cardRef/CE10g_v2.0.fa \
+>    --variant GA_1098.6_RGsorted.bam.vcf.gz \
+>    --variant GA_120.5_RGsorted.bam.vcf.gz \
+>    --variant ind3.vcf.gz \
+>    --variant ind4.vcf.gz \
+>    --variant ind5.vcf.gz \
+>    --variant ind6.vcf.gz \
+>   -O cbind_Inds.vcf.gz
+
+# 1b: Joint genotype
+>gatk --java-options "-Xmx4g" GenotypeGVCFs \
+>   -R /scratch/vas59108/references/cardRef/CE10g_v2.0.fa \
+>   -V cbind_Inds.vcf.gz \
+>   -O gtype_Inds.vcf.gz
+
+## 2: Only take SNP sites from filtered parents
+vcftools --gzvcf gtype_Inds.vcf.gz --positions afreq_filter.frq --recode --out sites_gtype_inds
+
+# this will produce your final vcf file which will be filtered further and used in Lepmap: sites_gtype_inds.recode.vcf
+# rename to get rid of 'recode' bit in name (put in automatically):
+mv sites_gtype_inds.recode.vcf sites_gtype_inds.vcf
+
+## 3: Filter the vcf file further for missingness and quality (this is set for 90% missing and mapping quality 30):
+vcftools --vcf sites_gtype_inds.vcf --max-missing 0.9 --minQ 30 --recode --out filt_sites_gtype_inds.vcf
+
+# rename again:
+mv filt_sites_gtype_inds.vcf.recode.vcf filt_sites_gtype_inds.vcf
+
+## 4: Keep loci only on chromosomes
+vcftools --vcf filt_sites_gtype_inds.vcf --out chrom_filt_sites_gtype_inds.vcf --recode --recode-INFO-all --chr CE10_chr1 --chr CE10_chr2 --chr CE10_chr3 --chr CE10_chr4 --chr CE10_chr5 --chr CE10_chr6 --chr CE10_chr7 --chr CE10_chr8
+
+## 4: Optional (but recommended) to calculate some stats to double check all your data filtering looks good:
+# can read the outfiles easily into R (or excel) to plot and make sure the data look good
+
+##Calculate allele frequency
+vcftools --vcf filt_sites_gtype_inds.vcf --freq2 --out afreq --max-alleles 2
+
+##Calculate mean depth per individual
+vcftools --vcf filt_sites_gtype_inds.vcf --depth --out ind_depth
+
+##Calculate mean depth per site
+vcftools --vcf filt_sites_gtype_inds.vcf --site-mean-depth --out site_depth
+
+##Calculate site quality
+vcftools --vcf filt_sites_gtype_inds.vcf --site-quality --out site_qual
+
+##Calculate proportion of missing data per individual
+vcftools --vcf filt_sites_gtype_inds.vcf --missing-indv --out ind_missing
+
+##Calculate proportion of missing data per site
+vcftools --vcf filt_sites_gtype_inds.vcf --missing-site --out site_missing
+
+## If anything looks off, you can diagnose with the above files, then refilter using vcftools as above
+
+#### With this final vcf file, you are aready for Lepmap! It's important to read through the wiki (https://sourceforge.net/p/lep-map3/wiki/LM3%20Home/) to understand what everything does and you may need to play around with the values a bunch to get a good map
+## You will need two files:
+filt_sites_gtype_inds.vcf 
+parcard_pedigreeVCF.txt
+
+## Step 1: call parent genotypes (for the RILs we make "dummy" parents based off grandparents)
+java -cp bin/ ParentCall2 data=parcard_pedigreeVCF.txt vcfFile=filt_sites_gtype_inds.vcf removeNonInformative=1 > data.call
+
+## Step 2: filter dataset based on missing data, segregation distortion, heterozygosity, and noninformative markers
+java -cp bin/ Filtering2 data=data.call dataTolerance=0.0001 removeNonInformative=1 heterozygoteRate=0.2 missingLimit=0.10 > data_f.call
+
+## Step 3: Separate chromosomes (linkage groups)
+# lodLimit and theta are important variables that will join or split linkage groups based on pairwise comparisons between markers
+# they will need to be played around with to get the right combination to get the correct number of linkage groups
+java -cp bin/ SeparateChromosomes2 data=data_f.call distortionLod=1 lodLimit=14 theta=0.30 > map.txt
+
+## Step 3a: view number of linkage groups and number of loci per LG
+sort map.txt|uniq -c|sort -n
+
+## Step 4: Order markers in each linkage group (this may take a bit to run and should be run a few times, take one with highest likelihood)
+java -cp bin/ OrderMarkers2 map=map.txt data=data_f.call grandparentPhase=1 useKosambi=1 sexAveraged=1 > order.txt
+
+## Step 5: convert to genotype matrix of included loci (uses lepmap script map2genotypes.awk)
+awk -vfullData=1 -f map2genotypes.awk order1.txt > gtypeMatrix.txt
+
+## Step 6: Getting loci>map info
+cut -f1,2 data_f.call > loci.txt
+
+#### You will now end with your final files:
+gtypeMatrix.txt (matrix of called genotypes included in your map)
+order.txt (ordered linkage map)
+map.txt (linkage group membership)
+loci.txt (included loci)
+
+## Now things get tricky because you have several files and you have to combine to match markers with linkage groups
+## It's a lot to type out so here is a great link that has short gifs (videos) describing what to do next
+## Start down at Step 2.0 'Checking the accuracy of the marker order' for help
+
+https://avikarn.com/2019-04-17-Genetic-Mapping-in-Lep-MAP3/
+
+#### After you have your final map you will be able to use rQTL!
+https://kbroman.org/qtl2/assets/vignettes/user_guide.html
